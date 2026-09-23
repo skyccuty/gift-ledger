@@ -126,6 +126,10 @@ label.f>span{display:block;font-size:13px;color:var(--muted);margin-bottom:4px}
 .check{display:flex;gap:8px;align-items:center;margin-top:12px;font-size:14px}
 .check input{width:18px;height:18px;accent-color:var(--accent)}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}
+.grid3{display:grid;grid-template-columns:1.2fr .8fr 1fr;gap:0 8px}
+.imp{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-top:10px}
+.imp .m{font-size:12px;color:var(--muted)}
+textarea.inp{font-size:14px;line-height:1.5}
 .price-inp{width:96px;text-align:right;padding:6px 8px}
 
 dialog{border:0;border-radius:16px 16px 0 0;padding:18px 16px calc(18px + env(safe-area-inset-bottom,0px));width:100%;max-width:640px;margin:auto auto 0;background:var(--surface);color:var(--ink);max-height:90vh;overflow:auto}
@@ -191,7 +195,7 @@ nav button[aria-current="page"]::before{content:"";position:absolute;top:0;left:
 
 <script>
 'use strict';
-const APP_VER='1.1';
+const APP_VER='1.2';
 const KEY='giftLedger.data.v1', PINKEY='giftLedger.pin.v1', SESS='giftLedger.unlocked';
 const TICKERS=[
   {code:'360750',name:'TIGER 미국S&P500',short:'S&P500'},
@@ -477,7 +481,9 @@ function vTrade(){
     </div>
   </section>
   <section>
-    <div class="head-row"><h2>매매 기록</h2><button class="addbtn" data-act="tradeNew" type="button">+ 기록</button></div>
+    <div class="head-row"><h2>매매 기록</h2><button class="addbtn" data-act="tradeNew" type="button">+ 직접 입력</button></div>
+    <div class="btns" style="margin:0 0 10px"><button class="btn" data-act="pasteNew" type="button">알림 붙여넣기</button><button class="btn ghost" data-act="photoNew" type="button">캡처 사진 인식</button></div>
+    <input type="file" id="photoFile" accept="image/*" class="hidden">
     <div class="list">
       ${ts.length?ts.map(t=>`<button class="row" type="button" data-act="tradeEdit" data-id="${t.id}">
         <div class="grow"><div class="t"><span class="tag ${t.side}">${t.side==='buy'?'매수':'매도'}</span>${tk(t.code).short}</div>
@@ -652,6 +658,8 @@ $('#view').addEventListener('click',async e=>{
   if(a==='tradeEdit')tradeForm(D.trades.find(x=>x.id===b.dataset.id));
   if(a==='planEdit')planForm(b.dataset.kid);
   if(a==='cashFix')cashForm();
+  if(a==='pasteNew')pasteForm();
+  if(a==='photoNew')$('#photoFile').click();
   if(a==='goCalc'){tab='calc';render()}
   if(a==='calcSave'){
     const {dep,prices,r}=lastCalc;const d=today();
@@ -672,8 +680,144 @@ $('#view').addEventListener('change',e=>{
   const i=e.target;
   if(i.dataset.price){const v=toNum(i.value);if(v>0){D.prices[i.dataset.price]={price:v,date:today()};save();render();toast('현재가를 저장했습니다')}}
   if(i.id==='restoreFile'&&i.files[0])doRestore(i.files[0]);
+  if(i.id==='photoFile'&&i.files[0]){photoImport(i.files[0]);i.value=''}
 });
 $('#view').addEventListener('input',e=>{if(e.target.id==='cDep'||e.target.dataset.cprice)calcRun()});
+
+/* ---------- 자동 입력 (알림 붙여넣기·사진 인식) ---------- */
+const NUM=s=>Number(String(s).replace(/[^0-9]/g,''))||0;
+function tickerFromText(s){
+  const m=s.match(/A?(360750|367380)/);if(m)return m[1];
+  if(/S\s*[&8]\s*P\s*5\s*0\s*0|S&P|에스앤피/i.test(s))return '360750';
+  if(/나\s*스\s*닥|NASDAQ|NASDA/i.test(s))return '367380';
+  if(/^\W*TIGER/i.test(s))return '360750';
+  if(/^\W*ACE\b/i.test(s))return '367380';
+  return null;
+}
+function childFromName(s){const k=D.children.find(c=>s&&s.includes(c.name));return k?k.id:null}
+
+/* 미래에셋 체결 알림 문자 분석 */
+function parseAlerts(text){
+  const blocks=text.split(/\[미래에셋증권\]/).map(b=>b.trim()).filter(Boolean);
+  const field=(b,k)=>{const m=b.match(new RegExp(k+'\\s*[:：]\\s*([^\\n]+)'));return m?m[1].trim():''};
+  const byOrder=new Map();let skipped=0;
+  blocks.forEach(b=>{
+    const code=tickerFromText(field(b,'종목명'));
+    const qty=NUM(field(b,'체결수량')),unit=NUM(field(b,'체결단가')),amt=NUM(field(b,'체결금액'));
+    if(!code||!qty||!(unit||amt)){skipped++;return}
+    const acct=field(b,'계좌명'),order=field(b,'주문번호')||uid();
+    const side=/매도/.test(field(b,'매매구분'))?'sell':'buy';
+    const key=acct+'|'+order;const prev=byOrder.get(key);
+    if(!prev||qty>=prev.qty)byOrder.set(key,{child:childFromName(acct)||cur,acct,code,side,qty,price:amt?Math.round(amt/qty):unit,amount:amt||qty*unit,order,full:/전량체결/.test(b)});
+  });
+  return {rows:[...byOrder.values()],skipped,total:null};
+}
+
+/* 체결/미체결 화면 캡처 인식 결과 분석 (줄 단위 인식 기준) */
+function parseOcr(text){
+  const lines=text.split(/\n/).map(l=>l.trim()).filter(Boolean);
+  let total=null,buyN=null,sellN=null,acct=null;const rows=[];
+  const nums=s=>(s.match(/\d[\d,\.]*/g)||[]).map(x=>NUM(x)).filter(n=>n>0);
+  for(let i=0;i<lines.length;i++){
+    const L=lines[i];
+    const am=L.match(/\d{3}-\d{4}-\d{4}-\d/);if(am&&!acct)acct=am[0];
+    if(/약\s*정\s*금\s*액/.test(L)){const m=L.match(/매\s*수\s*약\s*정\s*금\s*액\D*([\d,\.]+)/);if(m)total=NUM(m[1]);continue}
+    if(/체\s*결\s*수\s*량/.test(L)){const b=L.match(/매\s*수\s*체\s*결\s*수\s*량\D*(\d+)/),sl=L.match(/매\s*도\s*체\s*결\s*수\s*량\D*(\d+)/);if(b)buyN=+b[1];if(sl)sellN=+sl[1];continue}
+    const code=tickerFromText(L);if(!code)continue;
+    // 종목명 부분(앞 두 단어)을 지우고 숫자만 추출
+    let rest=L.replace(/^\W*(TIGER|ACE)\s*\S*/i,'').replace(/A?(360750|367380)/g,'');
+    let n=nums(rest);
+    for(let j=1;j<=2&&!n.some(x=>x>=1000&&x<=1000000);j++){if(lines[i+j]&&!tickerFromText(lines[i+j]))n=n.concat(nums(lines[i+j]))}
+    const pi=n.findIndex(x=>x>=1000&&x<=1000000);if(pi<0)continue;
+    const price=n[pi];const after=n.slice(pi+1).filter(x=>x<1000&&x>0);
+    const qty=after.length?after[after.length-1]:0;if(!qty)continue;
+    let side='buy';
+    if(buyN===0&&sellN>0)side='sell';else if(!(sellN===0)&&/매\s*도/.test(L))side='sell';
+    rows.push({child:(acct&&D.acctMap&&D.acctMap[acct])||cur,code,side,qty,price,amount:qty*price,acct});
+  }
+  // 상단 합계가 매수 전용이면 전부 매수로 확정
+  if(sellN===0)rows.forEach(r=>r.side='buy');
+  return {rows,skipped:0,total,acct,buyN};
+}
+
+let importRows=[],importTotal=null;
+function isDup(r,date){return D.trades.some(t=>t.child===r.child&&t.date===date&&t.code===r.code&&t.side===r.side&&t.qty===r.qty&&t.price===r.price)}
+function importReview(res,source){
+  importRows=res.rows;importTotal=res.total;const d=today();
+  if(!importRows.length){openSheet(`<h3>인식된 체결이 없습니다</h3><p class="sub">${source==='photo'?'체결/미체결 화면을 다시 캡처하거나 알림 붙여넣기를 이용하세요.':'미래에셋 체결 알림 전체([미래에셋증권]부터)를 붙여넣었는지 확인하세요.'}</p><div class="btns"><button class="btn ghost" type="button" data-sh="close">닫기</button><button class="btn" type="button" data-sh="tradeManual">직접 입력</button></div>`);return}
+  const rowsHtml=importRows.map((r,i)=>`<div class="imp">
+    <label class="check" style="margin-top:0"><input type="checkbox" data-i="${i}" data-f="use" ${isDup(r,d)?'':'checked'}> <b>${tk(r.code).short} ${r.side==='buy'?'매수':'매도'}</b>${isDup(r,d)?' <span class="tag todo">이미 기록됨</span>':''}${r.full===false?' <span class="tag todo">일부체결</span>':''}${r.acct?` <span class="m">${esc(r.acct)}</span>`:''}</label>
+    <div class="grid3">
+      <label class="f"><span>자녀</span><select class="inp" data-i="${i}" data-f="child">${D.children.map(k=>`<option value="${k.id}" ${k.id===r.child?'selected':''}>${esc(k.name)}</option>`).join('')}</select></label>
+      <label class="f"><span>수량</span><input class="inp num" inputmode="numeric" data-i="${i}" data-f="qty" value="${r.qty}"></label>
+      <label class="f"><span>체결가</span><input class="inp num" inputmode="numeric" data-i="${i}" data-f="price" value="${r.price}"></label>
+    </div></div>`).join('');
+  openSheet(`<h3>인식 결과 확인</h3><p class="sub">${source==='photo'?'사진 인식은 틀릴 수 있습니다. 숫자를 화면과 대조하세요.':'같은 주문번호의 알림은 최종 체결 1건으로 합쳤습니다.'}${res.skipped?` (읽지 못한 알림 ${res.skipped}건)`:''}</p>
+    <label class="f"><span>체결일</span><input type="date" class="inp" id="impDate" value="${d}"></label>
+    <div id="impRows">${rowsHtml}</div>
+    <div class="panel" style="margin-top:12px" id="impSum"></div>
+    <div class="btns"><button class="btn ghost" type="button" data-sh="close">취소</button><button class="btn" type="button" data-sh="impSave">선택한 건 저장</button></div>`);
+  impSum();
+}
+function impSum(){
+  let s=0,n=0;importRows.forEach((r,i)=>{if($(`[data-i="${i}"][data-f="use"]`)?.checked){s+=r.qty*r.price;n++}});
+  const all=importRows.reduce((a,r)=>a+r.qty*r.price,0);
+  let chk='';
+  if(importTotal!=null){const ok=all===importTotal;chk=`<p class="note">화면의 매수약정금액 ${won(importTotal)} / 인식 합계 ${won(all)} → <b class="${ok?'':'plus'}">${ok?'일치':'불일치: 숫자를 확인하세요'}</b></p>`}
+  $('#impSum').innerHTML=`<div class="limit-line"><span class="sub">저장할 ${n}건 합계</span><strong class="num">${won(s)}</strong></div>${chk}`;
+}
+sheet.addEventListener('input',e=>{
+  const i=e.target.dataset.i,f=e.target.dataset.f;if(i==null||!f)return;const r=importRows[+i];
+  if(f==='qty'||f==='price')r[f]=toNum(e.target.value);if(f==='child')r.child=e.target.value;
+  impSum();
+});
+sheet.addEventListener('change',e=>{if(e.target.dataset.f==='use'||e.target.dataset.f==='child'){const i=e.target.dataset.i;if(e.target.dataset.f==='child')importRows[+i].child=e.target.value;impSum()}});
+function pasteForm(){
+  openSheet(`<h3>체결 알림 붙여넣기</h3><p class="sub">미래에셋 체결 알림을 [미래에셋증권]부터 복사해 붙여넣으세요. 여러 건을 한꺼번에 붙여넣어도 됩니다.</p>
+    <textarea class="inp" id="pasteTxt" rows="9" style="margin-top:12px;resize:vertical" placeholder="[미래에셋증권] 전량체결&#10;계좌명 : 최이준&#10;종목명 : ACE 미국나스닥100(A367380)&#10;매매구분 : 매수&#10;..."></textarea>
+    <div class="btns"><button class="btn ghost" type="button" data-sh="pasteClip">클립보드에서 가져오기</button><button class="btn" type="button" data-sh="pasteRead">읽기</button></div>`);
+}
+let tessLoading=null;
+function loadTess(){
+  if(window.Tesseract)return Promise.resolve();
+  if(tessLoading)return tessLoading;
+  tessLoading=new Promise((res,rej)=>{const s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';s.onload=res;s.onerror=()=>{tessLoading=null;rej(new Error('load'))};document.head.appendChild(s)});
+  return tessLoading;
+}
+function prepImage(file){
+  return new Promise((res,rej)=>{const img=new Image();img.onload=()=>{
+    const sc=Math.min(2,2400/Math.max(img.width,img.height))||1;const c=document.createElement('canvas');
+    c.width=Math.round(img.width*sc);c.height=Math.round(img.height*sc);const x=c.getContext('2d');
+    x.drawImage(img,0,0,c.width,c.height);URL.revokeObjectURL(img.src);
+    const px=x.getImageData(0,0,c.width,c.height),d=px.data;
+    for(let k=0;k<d.length;k+=4){let g=.299*d[k]+.587*d[k+1]+.114*d[k+2];g=Math.max(0,Math.min(255,(g-128)*1.4+128));d[k]=d[k+1]=d[k+2]=g}
+    x.putImageData(px,0,0);res(c)};
+    img.onerror=rej;img.src=URL.createObjectURL(file)});
+}
+async function photoImport(file){
+  openSheet(`<h3>사진 인식 중</h3><p class="sub" id="ocrMsg">인식 도구를 준비하고 있습니다. 처음 한 번은 1분 정도 걸릴 수 있습니다.</p>`);
+  try{
+    await loadTess();const canvas=await prepImage(file);
+    const worker=await Tesseract.createWorker('kor+eng',1,{logger:m=>{const el=$('#ocrMsg');if(el&&m.status==='recognizing text')el.textContent=`글자를 읽는 중 ${Math.round(m.progress*100)}%`}});
+    await worker.setParameters({tessedit_pageseg_mode:'6'});
+    const r=await worker.recognize(canvas);await worker.terminate();
+    importReview(parseOcr(r.data.text),'photo');
+  }catch(e){openSheet(`<h3>사진을 읽지 못했습니다</h3><p class="sub">인터넷 연결을 확인하세요. 인식 도구는 처음 사용할 때 내려받아야 합니다.</p><div class="btns"><button class="btn ghost" type="button" data-sh="close">닫기</button><button class="btn" type="button" data-sh="pasteOpen">알림 붙여넣기</button></div>`)}
+}
+sheet.addEventListener('click',async e=>{
+  const b=e.target.closest('[data-sh]');if(!b)return;const a=b.dataset.sh;
+  if(a==='pasteOpen')pasteForm();
+  if(a==='tradeManual')tradeForm();
+  if(a==='pasteClip'){try{$('#pasteTxt').value=await navigator.clipboard.readText()}catch(err){toast('길게 눌러 직접 붙여넣으세요')}}
+  if(a==='pasteRead'){const t=$('#pasteTxt').value;if(!t.trim())return toast('알림 내용을 붙여넣으세요');importReview(parseAlerts(t),'paste')}
+  if(a==='impSave'){
+    const d=$('#impDate').value||today();let n=0;
+    D.acctMap=D.acctMap||{};importRows.forEach(r=>{if(r.acct&&/\d{3}-\d{4}/.test(r.acct))D.acctMap[r.acct]=r.child});
+    importRows.forEach((r,i)=>{if(!$(`[data-i="${i}"][data-f="use"]`).checked||!r.qty||!r.price)return;
+      D.trades.push({id:uid(),child:r.child,date:d,code:r.code,side:r.side,qty:r.qty,price:r.price,fee:0});n++});
+    save();closeSheet();render();toast(`${n}건을 저장했습니다`);
+  }
+});
 
 /* ---------- 암호 ---------- */
 const enc=new TextEncoder(),dec=new TextDecoder();
